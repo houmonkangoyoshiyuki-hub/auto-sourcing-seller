@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { ANTHROPIC_API_KEY, OPERATION_MODEL } from './config.js'
 
 // ============================================================
@@ -231,6 +231,8 @@ function ResearchTab({ minProfitDefault, onPrepare, showToast }) {
 - 販路: メルカリ / PayPayフリマ / BASE
 - リスク低め・回転が速い・扱いやすい(小さい/軽い/壊れにくい)商品を優先
 - 仕入れ先は具体的に(例: Amazon, アリエクスプレス, 卸サイト名, 実店舗名)
+- 可能な限り、実際に購入できる商品ページの具体的なURLをsourceUrlに入れてください(わからない場合は仕入れ先サイトのトップページURL)
+- 重要: メルカリ・PayPayフリマは「実際に所持していない商品」の出品を規約で禁止しています。「無在庫」提案でも、実際には先に1個だけ仕入れてから出品する前提で提案してください
 
 必ず次のJSON配列のみで回答してください(前置き・説明文・コードブロック記号は一切不要):
 [
@@ -238,6 +240,7 @@ function ResearchTab({ minProfitDefault, onPrepare, showToast }) {
     "name": "商品名",
     "mode": "無在庫" または "在庫あり",
     "source": "仕入れ先",
+    "sourceUrl": "仕入れ先の商品ページURL",
     "cost": 仕入れ値の数値,
     "price": 想定売価の数値,
     "fee": 手数料+送料の概算数値,
@@ -353,6 +356,18 @@ function ProposalCard({ p, onPrepare }) {
         <span style={{ ...S.badge, background: '#F2F2F7', color: '#3A3A3C' }}>仕入れ: {p.source}</span>
       </div>
 
+      {p.sourceUrl && (
+        <a href={p.sourceUrl} target="_blank" rel="noreferrer" style={S.sourceLink}>
+          仕入れ先ページを見る ↗
+        </a>
+      )}
+
+      {p.mode === '無在庫' && (
+        <div style={S.warnBox}>
+          ⚠️ 規約上、商品を持たずに出品するのはNGです。まず上のリンクから1個だけ仕入れてから出品してください。
+        </div>
+      )}
+
       <div style={S.profitRow}>
         <div>
           <div style={S.profitLabel}>見込み利益</div>
@@ -406,7 +421,7 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
 }`
       const text = await callClaude([{ role: 'user', content: prompt }], { maxTokens: 1500 })
       const d = parseJsonLoose(text)
-      setDraft({ ...d, proposal: p })
+      setDraft({ ...d, sourceUrl: p.sourceUrl || '', images: [], proposal: p })
     } catch (e) {
       setError('文面の生成に失敗しました: ' + e.message)
     } finally {
@@ -415,6 +430,7 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
   }
 
   const confirmListing = () => {
+    const mode = draft.proposal.mode
     const item = {
       id: 'L' + Date.now(),
       name: draft.proposal.name,
@@ -424,11 +440,20 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
       cost: Number(draft.proposal.cost),
       fee: Number(draft.proposal.fee),
       tags: draft.tags,
-      mode: draft.proposal.mode,
+      mode,
+      sourceUrl: draft.sourceUrl || '',
+      images: draft.images || [],
       status: '出品中',
-      shopsPosted: [],
+      // 在庫あり: 既に手元にあるので purchased/arrived は完了扱い
+      checklist:
+        mode === '在庫あり'
+          ? { purchased: true, arrived: true, packed: false, shipped: false }
+          : { purchased: false, arrived: false, packed: false, shipped: false },
+      trackingNo: '',
+      lastStockCheck: new Date().toISOString(),
       createdAt: new Date().toISOString(),
       soldAt: null,
+      shippedAt: null,
     }
     setListings([item, ...listings])
     setDraft(null)
@@ -436,18 +461,89 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
     showToast('出品リストに登録しました')
   }
 
+  // 「売れた」→ 対応中(チェックリスト)へ
   const markSold = (id) => {
     setListings(
+      listings.map((l) => (l.id === id ? { ...l, status: '対応中', soldAt: new Date().toISOString() } : l))
+    )
+    showToast('おめでとうございます!🎉 発送までのチェックリストを進めてください')
+  }
+
+  // 対応中 → 出品中に戻す(押し間違い対応)
+  const undoSold = (id) => {
+    setListings(
       listings.map((l) =>
-        l.id === id ? { ...l, status: '売却済み', soldAt: new Date().toISOString() } : l
+        l.id === id
+          ? {
+              ...l,
+              status: '出品中',
+              soldAt: null,
+              checklist:
+                l.mode === '在庫あり'
+                  ? { purchased: true, arrived: true, packed: false, shipped: false }
+                  : { purchased: false, arrived: false, packed: false, shipped: false },
+            }
+          : l
       )
     )
-    showToast('おめでとうございます!🎉 他ショップの取り下げを忘れずに')
+    showToast('出品中に戻しました')
+  }
+
+  // 完了 → 対応中に戻す(返品などの訂正用)
+  const undoComplete = (id) => {
+    setListings(
+      listings.map((l) => (l.id === id ? { ...l, status: '対応中', shippedAt: null } : l))
+    )
+    showToast('対応中に戻しました')
+  }
+
+  const toggleChecklist = (id, key) => {
+    setListings(
+      listings.map((l) =>
+        l.id === id ? { ...l, checklist: { ...l.checklist, [key]: !l.checklist[key] } } : l
+      )
+    )
+  }
+
+  const setTrackingNo = (id, val) => {
+    setListings(listings.map((l) => (l.id === id ? { ...l, trackingNo: val } : l)))
+  }
+
+  const completeShipping = (id) => {
+    setListings(
+      listings.map((l) =>
+        l.id === id ? { ...l, status: '完了', shippedAt: new Date().toISOString() } : l
+      )
+    )
+    showToast('発送完了!お疲れさまでした🎉')
+  }
+
+  const markStockChecked = (id, url) => {
+    if (url) window.open(url, '_blank', 'noopener')
+    setListings(
+      listings.map((l) => (l.id === id ? { ...l, lastStockCheck: new Date().toISOString() } : l))
+    )
+    showToast('確認日を更新しました')
+  }
+
+  const markOutOfStock = (id) => {
+    setListings(listings.map((l) => (l.id === id ? { ...l, status: '出品停止' } : l)))
+    showToast('出品を停止しました。ショップ側でも取り下げてください')
   }
 
   const removeListing = (id) => {
     setListings(listings.filter((l) => l.id !== id))
     showToast('削除しました')
+  }
+
+  const addListingImage = (id, src) => {
+    setListings(listings.map((l) => (l.id === id ? { ...l, images: [...(l.images || []), src] } : l)))
+  }
+
+  const removeListingImage = (id, i) => {
+    setListings(
+      listings.map((l) => (l.id === id ? { ...l, images: (l.images || []).filter((_, idx) => idx !== i) } : l))
+    )
   }
 
   const copy = async (text, label) => {
@@ -507,7 +603,24 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
             ))}
           </div>
 
+          <div style={{ marginTop: 16 }}>
+            <ImageGallery
+              images={draft.images || []}
+              onAdd={(src) => setDraft({ ...draft, images: [...(draft.images || []), src] })}
+              onRemove={(i) => setDraft({ ...draft, images: draft.images.filter((_, idx) => idx !== i) })}
+            />
+          </div>
+
           <div style={S.tipBox}>📷 {draft.photoTips}</div>
+          <div style={S.warnBox}>
+            ⚠️ 出品写真は必ずご自身で撮影したものを使ってください。仕入れ先の写真をそのまま転載すると規約違反になることがあります。
+          </div>
+
+          {draft.sourceUrl && (
+            <a href={draft.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 12 }}>
+              仕入れ先ページを開く(商品購入・参考写真の確認) ↗
+            </a>
+          )}
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
             <button
@@ -530,7 +643,11 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
 
   // ----- 出品リスト -----
   const active = listings.filter((l) => l.status === '出品中')
-  const sold = listings.filter((l) => l.status === '売却済み')
+  const inProgress = listings.filter((l) => l.status === '対応中')
+  const done = listings.filter((l) => l.status === '完了')
+  const stopped = listings.filter((l) => l.status === '出品停止')
+
+  const daysSince = (iso) => Math.floor((Date.now() - new Date(iso).getTime()) / 86400000)
 
   return (
     <div>
@@ -547,64 +664,177 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
         </div>
       )}
 
-      {active.map((l) => (
-        <div key={l.id} style={S.card}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-            <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35 }}>{l.title}</div>
-            <span style={{ ...S.badge, background: '#E8F8ED', color: '#1B8A3A', whiteSpace: 'nowrap' }}>
-              出品中
-            </span>
-          </div>
-          <div style={{ fontSize: 13, color: '#6E6E73', marginTop: 4 }}>
-            {yen(l.price)} ・ 見込み利益 {yen(l.price - l.cost - l.fee)} ・ {l.mode}
-          </div>
+      {active.map((l) => {
+        const needStockCheck = l.mode === '無在庫' && daysSince(l.lastStockCheck || l.createdAt) >= 3
+        return (
+          <div key={l.id} style={S.card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35 }}>{l.title}</div>
+              <span style={{ ...S.badge, background: '#E8F8ED', color: '#1B8A3A', whiteSpace: 'nowrap' }}>
+                出品中
+              </span>
+            </div>
+            <div style={{ fontSize: 13, color: '#6E6E73', marginTop: 4 }}>
+              {yen(l.price)} ・ 見込み利益 {yen(l.price - l.cost - l.fee)} ・ {l.mode}
+            </div>
 
-          <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-            <button style={S.miniBtn} onClick={() => copy(l.title, 'タイトル')}>タイトルをコピー</button>
-            <button style={S.miniBtn} onClick={() => copy(l.description, '説明文')}>説明文をコピー</button>
-            <button style={S.miniBtn} onClick={() => copy(l.tags.map((t) => '#' + t).join(' '), 'タグ')}>
-              タグをコピー
-            </button>
-          </div>
+            {needStockCheck && (
+              <div style={S.nudgeBox}>
+                🔔 仕入れ先の在庫、そろそろ確認しましょう(前回確認から{daysSince(l.lastStockCheck || l.createdAt)}日)
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <button style={{ ...S.miniBtn, background: '#FFF' }} onClick={() => markStockChecked(l.id, l.sourceUrl)}>
+                    見てきた(確認済みにする)
+                  </button>
+                  <button style={{ ...S.miniBtn, color: '#C42B1C', background: '#FFF' }} onClick={() => markOutOfStock(l.id)}>
+                    在庫切れだった
+                  </button>
+                </div>
+              </div>
+            )}
 
-          <div style={{ marginTop: 12 }}>
-            <div style={{ fontSize: 12, color: '#8E8E93', marginBottom: 6 }}>出品ページを開く:</div>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {shops.map((s) => (
-                <a key={s.id} href={s.sellUrl} target="_blank" rel="noreferrer" style={{ ...S.shopBtn, borderColor: s.color, color: s.color }}>
-                  {s.name} ↗
-                </a>
-              ))}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+              <button style={S.miniBtn} onClick={() => copy(l.title, 'タイトル')}>タイトルをコピー</button>
+              <button style={S.miniBtn} onClick={() => copy(l.description, '説明文')}>説明文をコピー</button>
+              <button style={S.miniBtn} onClick={() => copy(l.tags.map((t) => '#' + t).join(' '), 'タグ')}>
+                タグをコピー
+              </button>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <ImageGallery
+                images={l.images || []}
+                onAdd={(src) => addListingImage(l.id, src)}
+                onRemove={(i) => removeListingImage(l.id, i)}
+              />
+            </div>
+
+            {l.sourceUrl && (
+              <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 10 }}>
+                仕入れ先ページ ↗
+              </a>
+            )}
+
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 12, color: '#8E8E93', marginBottom: 6 }}>出品ページを開く:</div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {shops.map((s) => (
+                  <a key={s.id} href={s.sellUrl} target="_blank" rel="noreferrer" style={{ ...S.shopBtn, borderColor: s.color, color: s.color }}>
+                    {s.name} ↗
+                  </a>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+              <button style={{ ...S.secondaryBtn, flex: 1 }} onClick={() => removeListing(l.id)}>
+                削除
+              </button>
+              <button
+                style={{ ...S.primaryBtn, flex: 2, background: '#34C759' }}
+                onClick={() => markSold(l.id)}
+              >
+                売れた!🎉
+              </button>
             </div>
           </div>
+        )
+      })}
 
-          <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
-            <button style={{ ...S.secondaryBtn, flex: 1 }} onClick={() => removeListing(l.id)}>
-              削除
-            </button>
-            <button
-              style={{ ...S.primaryBtn, flex: 2, background: '#34C759' }}
-              onClick={() => markSold(l.id)}
-            >
-              売れた!🎉
-            </button>
-          </div>
-        </div>
-      ))}
-
-      {sold.length > 0 && (
+      {inProgress.length > 0 && (
         <>
-          <SectionTitle title="売却済み" sub="売れたら、他のショップの同じ商品を必ず取り下げてください" />
-          {sold.map((l) => (
+          <SectionTitle title="対応中" sub="発送までのチェックリストです。押し間違えたらいつでも「出品中に戻す」でOK" />
+          {inProgress.map((l) => {
+            const steps =
+              l.mode === '無在庫'
+                ? [
+                    { key: 'purchased', label: '仕入れ先で商品を購入した' },
+                    { key: 'arrived', label: '商品が到着した' },
+                    { key: 'packed', label: '検品して梱包した' },
+                    { key: 'shipped', label: '発送した' },
+                  ]
+                : [
+                    { key: 'packed', label: '梱包した' },
+                    { key: 'shipped', label: '発送した' },
+                  ]
+            const allDone = steps.every((s) => l.checklist[s.key])
+            return (
+              <div key={l.id} style={S.card}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                  <div style={{ fontSize: 15, fontWeight: 600 }}>{l.title}</div>
+                  <span style={{ ...S.badge, background: '#FFF4E0', color: '#B26A00', whiteSpace: 'nowrap' }}>
+                    対応中
+                  </span>
+                </div>
+                <div style={{ fontSize: 13, color: '#6E6E73', marginTop: 4 }}>
+                  売上 {yen(l.price)} ・ 利益 {yen(l.price - l.cost - l.fee)}
+                </div>
+
+                {l.sourceUrl && l.mode === '無在庫' && !l.checklist.purchased && (
+                  <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 10 }}>
+                    仕入れ先で購入する ↗
+                  </a>
+                )}
+
+                <div style={{ marginTop: 12 }}>
+                  {steps.map((s) => (
+                    <label key={s.key} style={S.checkRow}>
+                      <input
+                        type="checkbox"
+                        checked={!!l.checklist[s.key]}
+                        onChange={() => toggleChecklist(l.id, s.key)}
+                        style={S.checkbox}
+                      />
+                      <span style={{ textDecoration: l.checklist[s.key] ? 'line-through' : 'none', color: l.checklist[s.key] ? '#8E8E93' : '#1D1D1F' }}>
+                        {s.label}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+
+                {l.checklist.packed && (
+                  <div style={{ marginTop: 10 }}>
+                    <label style={S.label}>追跡番号(任意)</label>
+                    <input
+                      style={S.input}
+                      value={l.trackingNo}
+                      onChange={(e) => setTrackingNo(l.id, e.target.value)}
+                      placeholder="配送業者の追跡番号"
+                    />
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+                  <button style={{ ...S.secondaryBtn, flex: 1 }} onClick={() => undoSold(l.id)}>
+                    出品中に戻す
+                  </button>
+                  <button
+                    style={{ ...S.primaryBtn, flex: 2, opacity: allDone ? 1 : 0.4 }}
+                    disabled={!allDone}
+                    onClick={() => completeShipping(l.id)}
+                  >
+                    発送完了にする
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </>
+      )}
+
+      {done.length > 0 && (
+        <>
+          <SectionTitle title="完了" sub="発送済みの商品です。他ショップの取り下げも忘れずに" />
+          {done.map((l) => (
             <div key={l.id} style={{ ...S.card, opacity: 0.92 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                 <div style={{ fontSize: 15, fontWeight: 600 }}>{l.title}</div>
                 <span style={{ ...S.badge, background: '#F2F2F7', color: '#3A3A3C', whiteSpace: 'nowrap' }}>
-                  売却済み
+                  完了
                 </span>
               </div>
               <div style={{ fontSize: 13, color: '#6E6E73', marginTop: 4 }}>
                 売上 {yen(l.price)} ・ 利益 {yen(l.price - l.cost - l.fee)}
+                {l.trackingNo && <> ・ 追跡番号: {l.trackingNo}</>}
               </div>
               <div style={S.warnBox}>
                 ⚠️ 取り下げチェック — 他ショップに同じ商品が残っていたら削除:
@@ -615,6 +845,25 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
                     </a>
                   ))}
                 </div>
+              </div>
+              <button style={{ ...S.miniBtn, marginTop: 10 }} onClick={() => undoComplete(l.id)}>
+                間違えた場合: 対応中に戻す
+              </button>
+            </div>
+          ))}
+        </>
+      )}
+
+      {stopped.length > 0 && (
+        <>
+          <SectionTitle title="出品停止(在庫切れ等)" sub="" />
+          {stopped.map((l) => (
+            <div key={l.id} style={{ ...S.card, opacity: 0.7 }}>
+              <div style={{ fontSize: 14, fontWeight: 600 }}>{l.title}</div>
+              <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
+                <button style={{ ...S.secondaryBtn, flex: 1 }} onClick={() => removeListing(l.id)}>
+                  削除
+                </button>
               </div>
             </div>
           ))}
@@ -628,13 +877,13 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
 // ③ ダッシュボード + 週次レポート
 // ============================================================
 function DashboardTab({ listings, showToast }) {
-  const sold = listings.filter((l) => l.status === '売却済み')
-  const active = listings.filter((l) => l.status === '出品中')
+  const sold = listings.filter((l) => l.status === '完了')
+  const active = listings.filter((l) => l.status === '出品中' || l.status === '対応中')
   const sales = sold.reduce((a, l) => a + l.price, 0)
   const profit = sold.reduce((a, l) => a + (l.price - l.cost - l.fee), 0)
 
   const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
-  const soldThisWeek = sold.filter((l) => new Date(l.soldAt).getTime() >= weekAgo)
+  const soldThisWeek = sold.filter((l) => new Date(l.shippedAt || l.soldAt).getTime() >= weekAgo)
   const weekSales = soldThisWeek.reduce((a, l) => a + l.price, 0)
   const weekProfit = soldThisWeek.reduce((a, l) => a + (l.price - l.cost - l.fee), 0)
 
@@ -809,6 +1058,248 @@ function SettingsTab({ shops, setShops, minProfitDefault, setMinProfitDefault, s
 }
 
 // ============================================================
+// 画像加工ツール(仕入れ先スクショの軽加工用)
+// 正方形トリミング + 明るさ/コントラスト + なぞって隠す(白塗り)
+// ============================================================
+const IMG_SIZE = 1000 // BASE推奨サイズに近い正方形で書き出し
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.moveTo(x + r, y)
+  ctx.arcTo(x + w, y, x + w, y + h, r)
+  ctx.arcTo(x + w, y + h, x, y + h, r)
+  ctx.arcTo(x, y + h, x, y, r)
+  ctx.arcTo(x, y, x + w, y, r)
+  ctx.closePath()
+}
+
+function ImageEditorModal({ file, onSave, onCancel }) {
+  const canvasRef = useRef(null)
+  const imgRef = useRef(null)
+  const [ready, setReady] = useState(false)
+  const [brightness, setBrightness] = useState(100)
+  const [contrast, setContrast] = useState(100)
+  const [covers, setCovers] = useState([])
+  const drawingRef = useRef(null)
+
+  useEffect(() => {
+    const img = new Image()
+    img.onload = () => {
+      imgRef.current = img
+      setReady(true)
+    }
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      img.src = e.target.result
+    }
+    reader.readAsDataURL(file)
+  }, [file])
+
+  const render = () => {
+    const canvas = canvasRef.current
+    if (!canvas || !imgRef.current) return
+    const ctx = canvas.getContext('2d')
+    canvas.width = IMG_SIZE
+    canvas.height = IMG_SIZE
+    const img = imgRef.current
+    const scale = Math.max(IMG_SIZE / img.width, IMG_SIZE / img.height)
+    const w = img.width * scale
+    const h = img.height * scale
+    const x = (IMG_SIZE - w) / 2
+    const y = (IMG_SIZE - h) / 2
+    ctx.clearRect(0, 0, IMG_SIZE, IMG_SIZE)
+    ctx.fillStyle = '#FFFFFF'
+    ctx.fillRect(0, 0, IMG_SIZE, IMG_SIZE)
+    ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`
+    ctx.drawImage(img, x, y, w, h)
+    ctx.filter = 'none'
+    covers.forEach((c) => {
+      ctx.fillStyle = 'rgba(255,255,255,0.97)'
+      roundRectPath(ctx, c.x, c.y, c.w, c.h, 6)
+      ctx.fill()
+    })
+  }
+
+  useEffect(render, [ready, brightness, contrast, covers])
+
+  const getPos = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect()
+    const t = e.touches && e.touches[0]
+    const clientX = t ? t.clientX : e.clientX
+    const clientY = t ? t.clientY : e.clientY
+    const scaleX = canvasRef.current.width / rect.width
+    const scaleY = canvasRef.current.height / rect.height
+    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY }
+  }
+
+  const handleStart = (e) => {
+    e.preventDefault()
+    drawingRef.current = getPos(e)
+  }
+  const handleMove = (e) => {
+    if (!drawingRef.current) return
+    e.preventDefault()
+    const pos = getPos(e)
+    render()
+    const ctx = canvasRef.current.getContext('2d')
+    ctx.strokeStyle = '#0071E3'
+    ctx.lineWidth = 3
+    ctx.setLineDash([8, 6])
+    const s = drawingRef.current
+    ctx.strokeRect(Math.min(s.x, pos.x), Math.min(s.y, pos.y), Math.abs(pos.x - s.x), Math.abs(pos.y - s.y))
+  }
+  const handleEnd = (e) => {
+    if (!drawingRef.current) return
+    const t = e.changedTouches && e.changedTouches[0]
+    const pos = t
+      ? getPos({ touches: [t] })
+      : getPos(e)
+    const s = drawingRef.current
+    const w = Math.abs(pos.x - s.x)
+    const h = Math.abs(pos.y - s.y)
+    if (w > 12 && h > 12) {
+      setCovers((c) => [...c, { x: Math.min(s.x, pos.x), y: Math.min(s.y, pos.y), w, h }])
+    } else {
+      render()
+    }
+    drawingRef.current = null
+  }
+
+  const undoCover = () => setCovers((c) => c.slice(0, -1))
+  const resetAll = () => {
+    setBrightness(100)
+    setContrast(100)
+    setCovers([])
+  }
+  const save = () => {
+    const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.85)
+    onSave(dataUrl)
+  }
+
+  return (
+    <div style={S.modalOverlay}>
+      <div style={S.modalSheet}>
+        <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 4 }}>写真を加工</div>
+        <div style={{ fontSize: 12, color: '#6E6E73', marginBottom: 12, lineHeight: 1.6 }}>
+          指でなぞるとロゴ・価格・URLなどを白く隠せます。届いたら実物写真に差し替えるのが一番安全です。
+        </div>
+
+        <div style={S.canvasWrap}>
+          <canvas
+            ref={canvasRef}
+            style={S.canvas}
+            onMouseDown={handleStart}
+            onMouseMove={handleMove}
+            onMouseUp={handleEnd}
+            onMouseLeave={() => (drawingRef.current = null)}
+            onTouchStart={handleStart}
+            onTouchMove={handleMove}
+            onTouchEnd={handleEnd}
+          />
+          {!ready && <div style={S.canvasLoading}>読み込み中…</div>}
+        </div>
+
+        <label style={{ ...S.label, marginTop: 14 }}>明るさ {brightness}%</label>
+        <input
+          type="range"
+          min="60"
+          max="150"
+          value={brightness}
+          onChange={(e) => setBrightness(Number(e.target.value))}
+          style={S.slider}
+        />
+
+        <label style={{ ...S.label, marginTop: 10 }}>コントラスト {contrast}%</label>
+        <input
+          type="range"
+          min="60"
+          max="150"
+          value={contrast}
+          onChange={(e) => setContrast(Number(e.target.value))}
+          style={S.slider}
+        />
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+          <button style={{ ...S.miniBtn, flex: 1 }} onClick={undoCover} disabled={covers.length === 0}>
+            隠したのを1つ戻す
+          </button>
+          <button style={{ ...S.miniBtn, flex: 1 }} onClick={resetAll}>
+            全部やり直す
+          </button>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+          <button style={{ ...S.secondaryBtn, flex: 1 }} onClick={onCancel}>
+            キャンセル
+          </button>
+          <button style={{ ...S.primaryBtn, flex: 2 }} onClick={save} disabled={!ready}>
+            この写真を使う
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ImageGallery({ images, onAdd, onRemove }) {
+  const fileInputRef = useRef(null)
+  const [editingFile, setEditingFile] = useState(null)
+
+  const pickFile = () => fileInputRef.current && fileInputRef.current.click()
+
+  const onFileChange = (e) => {
+    const f = e.target.files && e.target.files[0]
+    if (f) setEditingFile(f)
+    e.target.value = ''
+  }
+
+  const saveImage = (dataUrl) => {
+    onAdd(dataUrl)
+    setEditingFile(null)
+  }
+
+  const downloadImage = (dataUrl, idx) => {
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = `photo_${idx + 1}.jpg`
+    a.target = '_blank'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }
+
+  return (
+    <div>
+      <label style={S.label}>商品写真({images.length}枚)</label>
+      <div style={S.gallery}>
+        {images.map((src, i) => (
+          <div key={i} style={S.galleryItem}>
+            <img src={src} alt="" style={S.galleryImg} />
+            <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+              <button style={S.galleryBtn} onClick={() => downloadImage(src, i)}>保存</button>
+              <button style={{ ...S.galleryBtn, color: '#C42B1C' }} onClick={() => onRemove(i)}>削除</button>
+            </div>
+          </div>
+        ))}
+        <button style={S.galleryAdd} onClick={pickFile}>
+          ＋<br />追加
+        </button>
+      </div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={onFileChange}
+      />
+      {editingFile && (
+        <ImageEditorModal file={editingFile} onSave={saveImage} onCancel={() => setEditingFile(null)} />
+      )}
+    </div>
+  )
+}
+
+// ============================================================
 // 共通パーツ / スタイル
 // ============================================================
 function SectionTitle({ title, sub }) {
@@ -885,6 +1376,50 @@ const S = {
   warnBox: {
     marginTop: 10, fontSize: 13, color: '#B26A00', background: '#FFF4E0',
     padding: '10px 12px', borderRadius: 12, lineHeight: 1.6,
+  },
+  nudgeBox: {
+    marginTop: 10, fontSize: 13, color: '#0055B0', background: '#EEF4FF',
+    padding: '10px 12px', borderRadius: 12, lineHeight: 1.6,
+  },
+  sourceLink: {
+    display: 'inline-block', marginTop: 8, fontSize: 13, fontWeight: 600, color: '#0071E3',
+  },
+  checkRow: {
+    display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', fontSize: 14,
+  },
+  checkbox: {
+    width: 20, height: 20, accentColor: '#0071E3', flexShrink: 0,
+  },
+  modalOverlay: {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 200,
+    display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+  },
+  modalSheet: {
+    width: '100%', maxWidth: 560, maxHeight: '92vh', overflowY: 'auto',
+    background: '#FFFFFF', borderRadius: '24px 24px 0 0', padding: '20px 18px calc(20px + env(safe-area-inset-bottom))',
+  },
+  canvasWrap: {
+    position: 'relative', width: '100%', aspectRatio: '1 / 1', background: '#F2F2F7',
+    borderRadius: 16, overflow: 'hidden',
+  },
+  canvas: {
+    width: '100%', height: '100%', display: 'block', touchAction: 'none',
+  },
+  canvasLoading: {
+    position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    fontSize: 13, color: '#8E8E93',
+  },
+  slider: { width: '100%', marginTop: 4, accentColor: '#0071E3' },
+  gallery: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 },
+  galleryItem: { width: 84 },
+  galleryImg: { width: 84, height: 84, objectFit: 'cover', borderRadius: 10, border: '1px solid #E5E5EA' },
+  galleryBtn: {
+    flex: 1, fontSize: 10, fontWeight: 600, color: '#0071E3', background: '#F2F2F7',
+    borderRadius: 6, padding: '4px 0',
+  },
+  galleryAdd: {
+    width: 84, height: 84, borderRadius: 10, border: '1.5px dashed #C7C7CC',
+    background: '#FAFAFA', color: '#8E8E93', fontSize: 12, lineHeight: 1.4,
   },
   errorBox: {
     marginTop: 12, fontSize: 13, color: '#C42B1C', background: '#FFE9E7',
