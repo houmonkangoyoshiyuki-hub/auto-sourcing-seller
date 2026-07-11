@@ -546,6 +546,10 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
     )
   }
 
+  const updateListingSourceUrl = (id, url) => {
+    setListings(listings.map((l) => (l.id === id ? { ...l, sourceUrl: url } : l)))
+  }
+
   const copy = async (text, label) => {
     try {
       await navigator.clipboard.writeText(text)
@@ -616,11 +620,23 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
             ⚠️ 出品写真は必ずご自身で撮影したものを使ってください。仕入れ先の写真をそのまま転載すると規約違反になることがあります。
           </div>
 
-          {draft.sourceUrl && (
-            <a href={draft.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 12 }}>
-              仕入れ先ページを開く(商品購入・参考写真の確認) ↗
-            </a>
-          )}
+          <label style={{ ...S.label, marginTop: 16 }}>仕入れ先URL</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              style={{ ...S.input, flex: 1 }}
+              value={draft.sourceUrl || ''}
+              onChange={(e) => setDraft({ ...draft, sourceUrl: e.target.value })}
+              placeholder="実際に購入するページのURLを貼り付け"
+            />
+            {draft.sourceUrl && (
+              <a href={draft.sourceUrl} target="_blank" rel="noreferrer" style={S.urlOpenBtn}>
+                開く
+              </a>
+            )}
+          </div>
+          <div style={{ fontSize: 12, color: '#8E8E93', marginTop: 6, lineHeight: 1.5 }}>
+            AIが探したリンクは変わったり違うページに飛んだりすることがあります。実際に開いて確認した正しいURLをここに貼り付けておくと安心です。
+          </div>
 
           <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
             <button
@@ -708,11 +724,22 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
               />
             </div>
 
-            {l.sourceUrl && (
-              <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 10 }}>
-                仕入れ先ページ ↗
-              </a>
-            )}
+            <div style={{ marginTop: 10 }}>
+              <label style={S.label}>仕入れ先URL</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  style={{ ...S.input, flex: 1 }}
+                  value={l.sourceUrl || ''}
+                  onChange={(e) => updateListingSourceUrl(l.id, e.target.value)}
+                  placeholder="購入ページのURLを貼り付け"
+                />
+                {l.sourceUrl && (
+                  <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={S.urlOpenBtn}>
+                    開く
+                  </a>
+                )}
+              </div>
+            </div>
 
             <div style={{ marginTop: 12 }}>
               <div style={{ fontSize: 12, color: '#8E8E93', marginBottom: 6 }}>出品ページを開く:</div>
@@ -769,11 +796,22 @@ function PrepareTab({ prepTarget, clearTarget, shops, listings, setListings, sho
                   売上 {yen(l.price)} ・ 利益 {yen(l.price - l.cost - l.fee)}
                 </div>
 
-                {l.sourceUrl && l.mode === '無在庫' && !l.checklist.purchased && (
-                  <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={{ ...S.sourceLink, marginTop: 10 }}>
-                    仕入れ先で購入する ↗
-                  </a>
-                )}
+                <div style={{ marginTop: 10 }}>
+                  <label style={S.label}>仕入れ先URL</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      style={{ ...S.input, flex: 1 }}
+                      value={l.sourceUrl || ''}
+                      onChange={(e) => updateListingSourceUrl(l.id, e.target.value)}
+                      placeholder="購入ページのURLを貼り付け"
+                    />
+                    {l.sourceUrl && (
+                      <a href={l.sourceUrl} target="_blank" rel="noreferrer" style={S.urlOpenBtn}>
+                        開く
+                      </a>
+                    )}
+                  </div>
+                </div>
 
                 <div style={{ marginTop: 12 }}>
                   {steps.map((s) => (
@@ -1383,6 +1421,11 @@ const S = {
   },
   sourceLink: {
     display: 'inline-block', marginTop: 8, fontSize: 13, fontWeight: 600, color: '#0071E3',
+  },
+  urlOpenBtn: {
+    display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+    fontSize: 13, fontWeight: 600, color: '#0071E3', background: '#EEF4FF',
+    padding: '0 16px', borderRadius: 12,
   },
   checkRow: {
     display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', fontSize: 14,
